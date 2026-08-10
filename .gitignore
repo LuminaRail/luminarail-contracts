@@ -1,0 +1,15 @@
+# Rust & Cargo build output
+target/
+
+# Cargo environment & lock overrides if needed
+**/*.rs.bk
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Secret files
+*.pem
+*.key
+.env
