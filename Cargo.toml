@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/settlement_vault",
+    "contracts/escrow",
+    "contracts/fee_manager",
+]
+
+[workspace.dependencies]
+soroban-sdk = "22.0.1"
+ed25519-dalek = "=2.2.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = false
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
