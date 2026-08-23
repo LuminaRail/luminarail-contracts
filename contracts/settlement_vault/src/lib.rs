@@ -200,14 +200,29 @@ mod test {
         let (token_address, _) = setup_test_token(&env, &admin);
 
         client.initialize(&admin);
-        client.create_settlement(&1, &source, &destination, &token_address, &100);
+        let original = client.create_settlement(&1, &source, &destination, &token_address, &100);
+        assert_eq!(original.status, SettlementStatus::Pending);
 
+        // Identical re-submit of the same settlement ID must fail closed.
         let err = client
             .try_create_settlement(&1, &source, &destination, &token_address, &100)
             .unwrap_err()
             .unwrap();
-
         assert_eq!(err, Error::AlreadyExists);
+
+        // Different payload but same ID is still a duplicate.
+        let other_dest = Address::generate(&env);
+        let err = client
+            .try_create_settlement(&1, &source, &other_dest, &token_address, &999)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, Error::AlreadyExists);
+
+        // Original pending record must be unchanged after rejected duplicates.
+        let stored = client.get_settlement(&1);
+        assert_eq!(stored, original);
+        assert_eq!(stored.amount, 100);
+        assert_eq!(stored.destination, destination);
     }
 
     #[test]
@@ -250,9 +265,118 @@ mod test {
 
         client.initialize(&admin);
         client.create_settlement(&1, &source, &destination, &token_address, &500);
-        client.execute_settlement(&1);
+        let executed = client.execute_settlement(&1);
+        assert_eq!(executed.status, SettlementStatus::Executed);
 
+        let token_client = token::Client::new(&env, &token_address);
+        assert_eq!(token_client.balance(&source), 500);
+        assert_eq!(token_client.balance(&destination), 500);
+
+        // First re-execution attempt on an already-executed settlement.
         let err = client.try_execute_settlement(&1).unwrap_err().unwrap();
         assert_eq!(err, Error::InvalidState);
+
+        // Repeated / concurrent-style follow-up attempts stay rejected.
+        let err = client.try_execute_settlement(&1).unwrap_err().unwrap();
+        assert_eq!(err, Error::InvalidState);
+
+        // Balances and stored status must not change after rejected re-execution.
+        assert_eq!(token_client.balance(&source), 500);
+        assert_eq!(token_client.balance(&destination), 500);
+        let stored = client.get_settlement(&1);
+        assert_eq!(stored.status, SettlementStatus::Executed);
+        assert_eq!(stored.amount, 500);
+    }
+
+    #[test]
+    fn test_vault_duplicate_create_after_execute_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        let destination = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&source, &2000);
+
+        client.initialize(&admin);
+        client.create_settlement(&42, &source, &destination, &token_address, &700);
+        client.execute_settlement(&42);
+
+        // Settlement IDs remain reserved after execution; recreation must fail.
+        let err = client
+            .try_create_settlement(&42, &source, &destination, &token_address, &700)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, Error::AlreadyExists);
+
+        let stored = client.get_settlement(&42);
+        assert_eq!(stored.status, SettlementStatus::Executed);
+        assert_eq!(stored.amount, 700);
+
+        let token_client = token::Client::new(&env, &token_address);
+        assert_eq!(token_client.balance(&source), 1300);
+        assert_eq!(token_client.balance(&destination), 700);
+    }
+
+    #[test]
+    fn test_vault_execute_unknown_settlement_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let err = client.try_execute_settlement(&999).unwrap_err().unwrap();
+        assert_eq!(err, Error::NotFound);
+    }
+
+    #[test]
+    fn test_vault_independent_ids_reject_only_duplicate_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        let destination = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&source, &5000);
+
+        client.initialize(&admin);
+        client.create_settlement(&1, &source, &destination, &token_address, &100);
+        client.create_settlement(&2, &source, &destination, &token_address, &200);
+
+        client.execute_settlement(&1);
+
+        // Sibling settlement remains executable after peer execution.
+        let executed_two = client.execute_settlement(&2);
+        assert_eq!(executed_two.status, SettlementStatus::Executed);
+
+        // Re-submitting execution for either processed ID fails independently.
+        assert_eq!(
+            client.try_execute_settlement(&1).unwrap_err().unwrap(),
+            Error::InvalidState
+        );
+        assert_eq!(
+            client.try_execute_settlement(&2).unwrap_err().unwrap(),
+            Error::InvalidState
+        );
+
+        let token_client = token::Client::new(&env, &token_address);
+        assert_eq!(token_client.balance(&source), 4700);
+        assert_eq!(token_client.balance(&destination), 300);
+        assert_eq!(client.get_settlement(&1).status, SettlementStatus::Executed);
+        assert_eq!(client.get_settlement(&2).status, SettlementStatus::Executed);
     }
 }
