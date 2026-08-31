@@ -30,6 +30,22 @@ ADMIN_PUBKEY="${STELLAR_SETTLEMENT_SIGNER_PUBLIC_KEY}"
 echo "🌐 Target Network: $NETWORK"
 echo "🔗 RPC URL:        $RPC_URL"
 
+OPTIMIZE=false
+GENERATE_BINDINGS=false
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --optimize) OPTIMIZE=true ;;
+        --bindings) GENERATE_BINDINGS=true ;;
+        -h|--help)
+            echo "Usage: ./deploy.sh [--optimize] [--bindings]"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+    shift
+done
+
 if ! command -v stellar &> /dev/null; then
     echo "❌ Error: 'stellar' CLI is not installed."
     echo "Install via: cargo install --locked stellar-cli"
@@ -43,6 +59,32 @@ echo ""
 echo "📦 Step 1: Compiling contracts using stellar contract build..."
 cd "$CONTRACTS_DIR"
 stellar contract build
+
+if [ "$OPTIMIZE" = true ]; then
+    if command -v wasm-opt &> /dev/null; then
+        echo "⚡ Optimizing WASM binaries with wasm-opt -Oz..."
+        for wasm in target/wasm32v1-none/release/*.wasm; do
+            if [ -f "$wasm" ]; then
+                wasm-opt -Oz "$wasm" -o "$wasm"
+                echo "   Optimized $wasm"
+            fi
+        done
+    else
+        echo "⚠️ wasm-opt is not installed; skipping optimization."
+    fi
+fi
+
+if [ "$GENERATE_BINDINGS" = true ]; then
+    echo "📜 Generating TypeScript bindings..."
+    mkdir -p bindings/ts
+    for contract in escrow settlement_vault fee_manager; do
+        wasm="target/wasm32v1-none/release/${contract}.wasm"
+        if [ -f "$wasm" ]; then
+            stellar contract bindings typescript --wasm "$wasm" --output-dir "bindings/ts/${contract}" --overwrite || true
+            echo "   Generated TypeScript bindings for ${contract}"
+        fi
+    done
+fi
 
 VAULT_WASM="target/wasm32v1-none/release/settlement_vault.wasm"
 ESCROW_WASM="target/wasm32v1-none/release/escrow.wasm"
