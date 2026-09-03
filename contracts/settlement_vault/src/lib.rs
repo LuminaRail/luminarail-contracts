@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+};
 
 /// Custom errors for Settlement Vault operations.
 #[contracterror]
@@ -118,6 +120,17 @@ impl SettlementVaultContract {
         };
 
         env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (Symbol::new(&env, "settlement_created"), settlement_id),
+            (
+                record.source.clone(),
+                record.destination.clone(),
+                record.asset.clone(),
+                record.amount,
+            ),
+        );
+
         Ok(record)
     }
 
@@ -147,6 +160,16 @@ impl SettlementVaultContract {
 
         record.status = SettlementStatus::Executed;
         env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (Symbol::new(&env, "settlement_executed"), settlement_id),
+            (
+                record.source.clone(),
+                record.destination.clone(),
+                record.amount,
+            ),
+        );
+
         Ok(record)
     }
 
@@ -159,8 +182,14 @@ impl SettlementVaultContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        token::StellarAssetClient,
+        Address, Env, Symbol, TryFromVal,
+    };
+    use std::vec::Vec as StdVec;
 
     fn setup_test_token<'a>(env: &Env, admin: &Address) -> (Address, StellarAssetClient<'a>) {
         let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -199,6 +228,93 @@ mod test {
         let token_client = token::Client::new(&env, &token_address);
         assert_eq!(token_client.balance(&source), 3000);
         assert_eq!(token_client.balance(&destination), 2000);
+    }
+
+    #[test]
+    fn test_vault_events_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        let destination = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&source, &5000);
+
+        client.initialize(&admin);
+
+        let settlement_id = 99u64;
+
+        // 1. Create Settlement
+        client.create_settlement(&settlement_id, &source, &destination, &token_address, &2000);
+
+        let all_events = env.events().all();
+        let contract_events: StdVec<_> = all_events
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 1);
+
+        let event1 = contract_events.first().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &event1.1.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "settlement_created")
+        );
+        assert_eq!(
+            u64::try_from_val(&env, &event1.1.get(1).unwrap()).unwrap(),
+            settlement_id
+        );
+
+        // 2. Execute Settlement
+        client.execute_settlement(&settlement_id);
+
+        let all_events = env.events().all();
+        let contract_events: StdVec<_> = all_events
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 1);
+
+        let event2 = contract_events.first().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &event2.1.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "settlement_executed")
+        );
+        assert_eq!(
+            u64::try_from_val(&env, &event2.1.get(1).unwrap()).unwrap(),
+            settlement_id
+        );
+    }
+
+    #[test]
+    fn test_failed_vault_operations_emit_no_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        let destination = Address::generate(&env);
+        let (token_address, _) = setup_test_token(&env, &admin);
+
+        client.initialize(&admin);
+
+        // Attempt zero amount settlement -> error
+        let _ = client.try_create_settlement(&1, &source, &destination, &token_address, &0);
+
+        let contract_events: StdVec<_> = env
+            .events()
+            .all()
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 0);
     }
 
     #[test]

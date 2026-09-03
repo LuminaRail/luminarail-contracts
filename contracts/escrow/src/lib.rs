@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+};
 
 /// Custom errors for Escrow contract operations.
 #[contracterror]
@@ -103,6 +105,17 @@ impl EscrowContract {
         };
 
         env.storage().persistent().set(&key, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "escrow_created"), escrow_id),
+            (
+                escrow.depositor.clone(),
+                escrow.beneficiary.clone(),
+                escrow.asset.clone(),
+                escrow.amount,
+            ),
+        );
+
         Ok(escrow)
     }
 
@@ -132,6 +145,12 @@ impl EscrowContract {
 
         escrow.status = EscrowStatus::Funded;
         env.storage().persistent().set(&key, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "escrow_funded"), escrow_id),
+            (escrow.depositor.clone(), escrow.amount),
+        );
+
         Ok(escrow)
     }
 
@@ -165,6 +184,12 @@ impl EscrowContract {
 
         escrow.status = EscrowStatus::Released;
         env.storage().persistent().set(&key, &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "escrow_released"), escrow_id),
+            (escrow.beneficiary.clone(), escrow.amount),
+        );
+
         Ok(escrow)
     }
 
@@ -177,8 +202,14 @@ impl EscrowContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        token::StellarAssetClient,
+        Address, Env, Symbol, TryFromVal,
+    };
+    use std::vec::Vec as StdVec;
 
     fn setup_test_token<'a>(env: &Env, admin: &Address) -> (Address, StellarAssetClient<'a>) {
         let token_id = env.register_stellar_asset_contract_v2(admin.clone());
@@ -230,6 +261,116 @@ mod test {
 
         assert_eq!(token_client.balance(&contract_id), 0);
         assert_eq!(token_client.balance(&beneficiary), 500);
+    }
+
+    #[test]
+    fn test_escrow_events_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&depositor, &1000);
+
+        let escrow_id = 42u64;
+        let amount = 500i128;
+
+        // 1. Create
+        client.create_escrow(
+            &escrow_id,
+            &depositor,
+            &beneficiary,
+            &token_address,
+            &amount,
+        );
+
+        let all_events = env.events().all();
+        let contract_events: StdVec<_> = all_events
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 1);
+
+        let event1 = contract_events.first().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &event1.1.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "escrow_created")
+        );
+        assert_eq!(
+            u64::try_from_val(&env, &event1.1.get(1).unwrap()).unwrap(),
+            escrow_id
+        );
+
+        // 2. Fund
+        client.fund_escrow(&escrow_id, &amount);
+
+        let all_events = env.events().all();
+        let contract_events: StdVec<_> = all_events
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 1);
+
+        let event2 = contract_events.first().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &event2.1.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "escrow_funded")
+        );
+        assert_eq!(
+            u64::try_from_val(&env, &event2.1.get(1).unwrap()).unwrap(),
+            escrow_id
+        );
+
+        // 3. Release
+        client.release_escrow(&escrow_id, &admin);
+
+        let all_events = env.events().all();
+        let contract_events: StdVec<_> = all_events
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 1);
+
+        let event3 = contract_events.first().unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &event3.1.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "escrow_released")
+        );
+        assert_eq!(
+            u64::try_from_val(&env, &event3.1.get(1).unwrap()).unwrap(),
+            escrow_id
+        );
+    }
+
+    #[test]
+    fn test_failed_escrow_operations_emit_no_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let (token_address, _) = setup_test_token(&env, &admin);
+
+        // Attempt creation with zero amount -> error
+        let _ = client.try_create_escrow(&1, &depositor, &beneficiary, &token_address, &0);
+
+        let contract_events: StdVec<_> = env
+            .events()
+            .all()
+            .into_iter()
+            .filter(|e| e.0 == contract_id)
+            .collect();
+        assert_eq!(contract_events.len(), 0);
     }
 
     #[test]
