@@ -211,4 +211,32 @@ mod test {
             .unwrap();
         assert_eq!(err, Error::Overflow);
     }
+
+    #[test]
+    fn test_fee_manager_negative_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &25);
+
+        let err = client.try_calculate_fee(&-100).unwrap_err().unwrap();
+        assert_eq!(err, Error::InvalidAmount);
+    }
+
+    #[test]
+    fn test_fee_manager_uninitialized_access_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+
+        let err = client.try_set_fee_basis_points(&50).unwrap_err().unwrap();
+        assert_eq!(err, Error::NotInitialized);
+    }
 }
+

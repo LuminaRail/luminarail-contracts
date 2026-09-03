@@ -320,4 +320,39 @@ mod test {
         let err = client.try_release_escrow(&1, &admin).unwrap_err().unwrap();
         assert_eq!(err, Error::InvalidState);
     }
+
+    #[test]
+    fn test_escrow_not_found_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let err = client.try_get_escrow(&9999).unwrap_err().unwrap();
+        assert_eq!(err, Error::NotFound);
+    }
+
+    #[test]
+    fn test_escrow_funding_amount_mismatch_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&depositor, &1000);
+
+        client.create_escrow(&1, &depositor, &beneficiary, &token_address, &500);
+
+        // Attempting to fund with mismatched amount 300 instead of 500
+        let err = client.try_fund_escrow(&1, &300).unwrap_err().unwrap();
+        assert_eq!(err, Error::InvalidAmount);
+    }
 }
+

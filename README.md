@@ -1,11 +1,36 @@
 # LuminaRail Smart Contracts (`luminarail-contracts`)
 
+[![CI Status](https://github.com/LuminaRail/luminarail-contracts/workflows/Smart%20Contracts%20CI/badge.svg)](https://github.com/LuminaRail/luminarail-contracts/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Network: Stellar Testnet](https://img.shields.io/badge/Network-Stellar%20Testnet-purple.svg)](https://stellar.org)
+[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org)
+
 > **Open financial rails for Stellar.**
 
 `luminarail-contracts` contains the Soroban smart contracts written in Rust for LuminaRail's cross-border settlement infrastructure on the Stellar network.
 
 > [!CAUTION]
 > **TESTNET DEVELOPMENT CONTRACTS**: These smart contracts are designed strictly for **Stellar Testnet** development, testing, and simulation. They must NOT be treated as production-ready mainnet custody infrastructure or deployed to Mainnet without comprehensive security audits.
+
+---
+
+## Repository Cross-References
+
+LuminaRail is organized across three modular open-source repositories:
+- **`luminarail-contracts`** (This repository): Soroban smart contracts written in Rust (`escrow`, `settlement_vault`, `fee_manager`).
+- **[`luminarail-backend`](../luminarail-backend)**: Express / Node.js API service handling FX rates, order state machines, Paystack webhooks, and Soroban transaction submission.
+- **[`luminarail-frontend`](../luminarail-frontend)**: Next.js 16 UI application for merchants, dashboard analytics, order tracking, and wallet integration.
+
+---
+
+## Production vs. Sandbox Integrations
+
+| Subsystem / Integration | Sandbox / Development Status | Production Requirement |
+| :--- | :--- | :--- |
+| **Network Ledger** | **Stellar Testnet** (Soroban RPC & Horizon RPC) | Independent Mainnet security audit & deployment |
+| **Token Asset Contract** | Testnet Mock USDC Stellar Asset Contract | Official Circle Mainnet USDC Asset Contract (`GA5ZSEJYB37JRC5AVCIA5XYGEVYWM3D3THC7WUXDVXD4TXMKT626B6AC`) |
+| **Contract Administration** | Single Admin key in test environment | Multi-signature Gnosis / Soroban admin vault |
+| **Storage TTL** | Bumped manually / during test iterations | Automated cron worker for TTL bumping |
 
 ---
 
