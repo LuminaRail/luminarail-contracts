@@ -355,4 +355,3 @@ mod test {
         assert_eq!(err, Error::InvalidAmount);
     }
 }
-
