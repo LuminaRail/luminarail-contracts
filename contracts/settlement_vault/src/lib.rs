@@ -1,50 +1,74 @@
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
+/// Custom errors for Settlement Vault operations.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// Contract instance already initialized.
     AlreadyInitialized = 1,
+    /// Invoker lacks administrative or entity authorization.
     Unauthorized = 2,
+    /// Transfer amount is zero or negative.
     InvalidAmount = 3,
+    /// Settlement record not found.
     NotFound = 4,
+    /// Settlement ID already exists.
     AlreadyExists = 5,
+    /// Invalid settlement status transition attempt.
     InvalidState = 6,
+    /// Contract instance has not been initialized.
     NotInitialized = 7,
 }
 
+/// Status lifecycle state for a Settlement record.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum SettlementStatus {
+    /// Settlement created and awaiting execution.
     Pending = 0,
+    /// Settlement successfully executed and tokens transferred.
     Executed = 1,
+    /// Settlement execution failed.
     Failed = 2,
 }
 
+/// Data structure representing an atomic settlement instruction.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettlementRecord {
+    /// Unique identifier for the settlement.
     pub settlement_id: u64,
+    /// Source funding address.
     pub source: Address,
+    /// Destination receiving address.
     pub destination: Address,
+    /// Asset contract address.
     pub asset: Address,
+    /// Settlement amount.
     pub amount: i128,
+    /// Current status of the settlement.
     pub status: SettlementStatus,
 }
 
+/// Storage keys for Settlement Vault state.
 #[contracttype]
 pub enum DataKey {
+    /// Instance admin address.
     Admin,
+    /// Persistent settlement record keyed by settlement_id.
     Settlement(u64),
 }
 
+/// Smart contract vault managing institutional multi-asset payment settlements on Soroban.
 #[contract]
 pub struct SettlementVaultContract;
 
 #[contractimpl]
 impl SettlementVaultContract {
+    /// Initializes the vault instance with an administrative address.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -54,6 +78,7 @@ impl SettlementVaultContract {
         Ok(())
     }
 
+    /// Returns the active administrative address.
     pub fn get_admin(env: Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -61,6 +86,8 @@ impl SettlementVaultContract {
             .ok_or(Error::NotInitialized)
     }
 
+    /// Registers a new pending settlement record.
+    /// Requires administrative authorization.
     pub fn create_settlement(
         env: Env,
         settlement_id: u64,
@@ -94,6 +121,8 @@ impl SettlementVaultContract {
         Ok(record)
     }
 
+    /// Executes a pending settlement instruction by transferring tokens from `source` to `destination`.
+    /// Requires dual authorization from both `admin` and `source`.
     pub fn execute_settlement(env: Env, settlement_id: u64) -> Result<SettlementRecord, Error> {
         let admin = Self::get_admin(env.clone())?;
         admin.require_auth();
@@ -121,6 +150,7 @@ impl SettlementVaultContract {
         Ok(record)
     }
 
+    /// Retrieves a settlement record by `settlement_id`.
     pub fn get_settlement(env: Env, settlement_id: u64) -> Result<SettlementRecord, Error> {
         let key = DataKey::Settlement(settlement_id);
         env.storage().persistent().get(&key).ok_or(Error::NotFound)
