@@ -205,9 +205,9 @@ mod test {
     extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events},
+        testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryFromVal,
+        Address, Env, IntoVal, Symbol, TryFromVal,
     };
     use std::vec::Vec as StdVec;
 
@@ -494,5 +494,406 @@ mod test {
         // Attempting to fund with mismatched amount 300 instead of 500
         let err = client.try_fund_escrow(&1, &300).unwrap_err().unwrap();
         assert_eq!(err, Error::InvalidAmount);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Authorization matrix (issue #21)
+    //
+    // Privileged entrypoints: `create_escrow`, `fund_escrow`, `release_escrow`.
+    // Matrix tests never rely on `mock_all_auths` for the call under test: they
+    // provide exact `env.mock_auths()` entries so every `require_auth` must match
+    // the precise (address, fn, args) invocation tree or the call fails.
+    // ---------------------------------------------------------------------------
+
+    /// Initialized escrow fixture. Auth mocking is left ENABLED after setup so
+    /// tests can create escrows; call `enforce_real_auth` before the
+    /// authorization matrix call under test.
+    struct EscrowAuthFixture {
+        env: Env,
+        contract_id: Address,
+        depositor: Address,
+        beneficiary: Address,
+        token_address: Address,
+    }
+
+    fn setup_escrow_auth_fixture() -> EscrowAuthFixture {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(EscrowContract, ());
+
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &depositor);
+
+        token_admin.mint(&depositor, &5000);
+
+        EscrowAuthFixture {
+            env,
+            contract_id,
+            depositor,
+            beneficiary,
+            token_address,
+        }
+    }
+
+    fn create_pending_escrow(fixture: &EscrowAuthFixture, escrow_id: u64, amount: i128) {
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+        client.create_escrow(
+            &escrow_id,
+            &fixture.depositor,
+            &fixture.beneficiary,
+            &fixture.token_address,
+            &amount,
+        );
+    }
+
+    fn fund_pending_escrow(fixture: &EscrowAuthFixture, escrow_id: u64, amount: i128) {
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+        client.fund_escrow(&escrow_id, &amount);
+    }
+
+    /// Disables blanket auth mocking so only explicitly mocked authorizations pass.
+    fn enforce_real_auth(env: &Env) {
+        env.set_auths(&[]);
+    }
+
+    // -- create_escrow -----------------------------------------------------------
+
+    #[test]
+    fn test_escrow_auth_create_depositor_authorized_succeeds() {
+        let fixture = setup_escrow_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let escrow_id = 50u64;
+        let amount = 500i128;
+        let depositor_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "create_escrow",
+            args: (
+                &escrow_id,
+                &fixture.depositor,
+                &fixture.beneficiary,
+                &fixture.token_address,
+                &amount,
+            )
+                .into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.depositor,
+            invoke: &depositor_invoke,
+        }]);
+
+        let escrow = client.create_escrow(
+            &escrow_id,
+            &fixture.depositor,
+            &fixture.beneficiary,
+            &fixture.token_address,
+            &amount,
+        );
+        assert_eq!(escrow.status, EscrowStatus::Created);
+    }
+
+    #[test]
+    fn test_escrow_auth_create_non_depositor_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let escrow_id = 50u64;
+        let amount = 500i128;
+        let attacker = Address::generate(&fixture.env);
+        // The attacker authorizes a creation attempt naming themselves as the
+        // depositor; it must not satisfy the real depositor's authorization.
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "create_escrow",
+            args: (
+                &escrow_id,
+                &attacker,
+                &fixture.beneficiary,
+                &fixture.token_address,
+                &amount,
+            )
+                .into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client
+                .try_create_escrow(
+                    &escrow_id,
+                    &fixture.depositor,
+                    &fixture.beneficiary,
+                    &fixture.token_address,
+                    &amount
+                )
+                .is_err(),
+            "non-depositor caller must not be able to create an escrow"
+        );
+        assert_eq!(
+            client.try_get_escrow(&escrow_id).unwrap_err().unwrap(),
+            Error::NotFound
+        );
+    }
+
+    #[test]
+    fn test_escrow_auth_create_missing_authorization_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let escrow_id = 50u64;
+        let amount = 500i128;
+        assert!(
+            client
+                .try_create_escrow(
+                    &escrow_id,
+                    &fixture.depositor,
+                    &fixture.beneficiary,
+                    &fixture.token_address,
+                    &amount
+                )
+                .is_err(),
+            "create_escrow must fail with no authorization provided"
+        );
+        assert_eq!(
+            client.try_get_escrow(&escrow_id).unwrap_err().unwrap(),
+            Error::NotFound
+        );
+    }
+
+    // -- fund_escrow -------------------------------------------------------------
+
+    #[test]
+    fn test_escrow_auth_fund_depositor_authorized_succeeds() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 60u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Depositor authorizes both the escrow funding and the nested transfer.
+        let transfer_invoke = MockAuthInvoke {
+            contract: &fixture.token_address,
+            fn_name: "transfer",
+            args: (&fixture.depositor, &fixture.contract_id, &amount).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let depositor_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "fund_escrow",
+            args: (&escrow_id, &amount).into_val(&fixture.env),
+            sub_invokes: &[transfer_invoke],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.depositor,
+            invoke: &depositor_invoke,
+        }]);
+
+        let escrow = client.fund_escrow(&escrow_id, &amount);
+        assert_eq!(escrow.status, EscrowStatus::Funded);
+
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.contract_id), amount);
+    }
+
+    #[test]
+    fn test_escrow_auth_fund_non_depositor_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 60u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // An unrelated account authorizes the exact funding invocation.
+        let attacker = Address::generate(&fixture.env);
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "fund_escrow",
+            args: (&escrow_id, &amount).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client.try_fund_escrow(&escrow_id, &amount).is_err(),
+            "non-depositor must not be able to fund an escrow"
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Created);
+    }
+
+    #[test]
+    fn test_escrow_auth_fund_missing_authorization_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 60u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        assert!(
+            client.try_fund_escrow(&escrow_id, &amount).is_err(),
+            "fund_escrow must fail with no authorization provided"
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Created);
+    }
+
+    #[test]
+    fn test_escrow_auth_fund_missing_transfer_authorization_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 60u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Depositor authorizes fund_escrow but not the nested token transfer
+        // (partial authorization).
+        let depositor_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "fund_escrow",
+            args: (&escrow_id, &amount).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.depositor,
+            invoke: &depositor_invoke,
+        }]);
+
+        assert!(
+            client.try_fund_escrow(&escrow_id, &amount).is_err(),
+            "funding without the nested transfer authorization must be rejected"
+        );
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.depositor), 5000);
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Created);
+    }
+
+    // -- release_escrow ----------------------------------------------------------
+
+    #[test]
+    fn test_escrow_auth_release_authority_authorized_succeeds() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 70u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        fund_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // The depositor acts as the release authority in this scenario.
+        let authority_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "release_escrow",
+            args: (&escrow_id, &fixture.depositor).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.depositor,
+            invoke: &authority_invoke,
+        }]);
+
+        let escrow = client.release_escrow(&escrow_id, &fixture.depositor);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.beneficiary), amount);
+    }
+
+    #[test]
+    fn test_escrow_auth_release_non_authority_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 70u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        fund_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // An attacker authorizes the exact release invocation but is not the
+        // named release authority.
+        let attacker = Address::generate(&fixture.env);
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "release_escrow",
+            args: (&escrow_id, &fixture.depositor).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client
+                .try_release_escrow(&escrow_id, &fixture.depositor)
+                .is_err(),
+            "an address other than the release authority must be rejected"
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.beneficiary), 0);
+    }
+
+    #[test]
+    fn test_escrow_auth_release_missing_authorization_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 70u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        fund_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        assert!(
+            client
+                .try_release_escrow(&escrow_id, &fixture.depositor)
+                .is_err(),
+            "release_escrow must fail with no authorization provided"
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+    }
+
+    #[test]
+    fn test_escrow_auth_release_unrelated_authorization_rejected() {
+        let fixture = setup_escrow_auth_fixture();
+        let escrow_id = 70u64;
+        let amount = 500i128;
+        create_pending_escrow(&fixture, escrow_id, amount);
+        fund_pending_escrow(&fixture, escrow_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = EscrowContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // The authority authorizes an unrelated function instead of the release.
+        let authority_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "get_escrow",
+            args: (&escrow_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.depositor,
+            invoke: &authority_invoke,
+        }]);
+
+        assert!(
+            client
+                .try_release_escrow(&escrow_id, &fixture.depositor)
+                .is_err(),
+            "authorization for an unrelated function must be rejected"
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
     }
 }
