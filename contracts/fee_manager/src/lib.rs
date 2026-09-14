@@ -105,7 +105,10 @@ impl FeeManagerContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        Address, Env, IntoVal,
+    };
 
     #[test]
     fn test_fee_manager_initialization() {
@@ -237,5 +240,201 @@ mod test {
 
         let err = client.try_set_fee_basis_points(&50).unwrap_err().unwrap();
         assert_eq!(err, Error::NotInitialized);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Authorization matrix (issue #21)
+    //
+    // Privileged entrypoints: `initialize`, `set_fee_basis_points`.
+    // Matrix tests never rely on `mock_all_auths` for the call under test: they
+    // provide exact `env.mock_auths()` entries so every `require_auth` must match
+    // the precise (address, fn, args) invocation tree or the call fails.
+    // ---------------------------------------------------------------------------
+
+    /// Initialized fee manager fixture. Auth mocking is left ENABLED after
+    /// setup; call `enforce_real_auth` before the authorization matrix call
+    /// under test.
+    struct FeeManagerAuthFixture {
+        env: Env,
+        contract_id: Address,
+        admin: Address,
+    }
+
+    fn setup_fee_manager_auth_fixture() -> FeeManagerAuthFixture {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &25);
+
+        FeeManagerAuthFixture {
+            env,
+            contract_id,
+            admin,
+        }
+    }
+
+    /// Disables blanket auth mocking so only explicitly mocked authorizations pass.
+    fn enforce_real_auth(env: &Env) {
+        env.set_auths(&[]);
+    }
+
+    // -- initialize --------------------------------------------------------------
+
+    #[test]
+    fn test_fee_manager_auth_initialize_admin_authorized_succeeds() {
+        let env = Env::default();
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        let admin_invoke = MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&admin, &50u32).into_val(&env),
+            sub_invokes: &[],
+        };
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &admin_invoke,
+        }]);
+
+        client.initialize(&admin, &50);
+        assert_eq!(client.get_fee_basis_points(), 50);
+    }
+
+    #[test]
+    fn test_fee_manager_auth_initialize_missing_authorization_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        assert!(
+            client.try_initialize(&admin, &50u32).is_err(),
+            "initialize must fail without admin authorization"
+        );
+        // The admin must not have been recorded.
+        assert_eq!(
+            client.try_set_fee_basis_points(&50).unwrap_err().unwrap(),
+            Error::NotInitialized
+        );
+    }
+
+    #[test]
+    fn test_fee_manager_auth_initialize_unrelated_authorization_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(FeeManagerContract, ());
+        let client = FeeManagerContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // The attacker authorizes their own (attacker, initialize, ...) call;
+        // it must not satisfy the admin's authorization.
+        let attacker_invoke = MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&attacker, &50u32).into_val(&env),
+            sub_invokes: &[],
+        };
+        env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client.try_initialize(&admin, &50u32).is_err(),
+            "unrelated authorization must not satisfy admin authorization"
+        );
+    }
+
+    // -- set_fee_basis_points ----------------------------------------------------
+
+    #[test]
+    fn test_fee_manager_auth_set_fee_admin_authorized_succeeds() {
+        let fixture = setup_fee_manager_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = FeeManagerContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "set_fee_basis_points",
+            args: (&100u32,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        client.set_fee_basis_points(&100);
+        assert_eq!(client.get_fee_basis_points(), 100);
+    }
+
+    #[test]
+    fn test_fee_manager_auth_set_fee_non_admin_rejected() {
+        let fixture = setup_fee_manager_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = FeeManagerContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // A non-admin authorizes the exact same invocation.
+        let attacker = Address::generate(&fixture.env);
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "set_fee_basis_points",
+            args: (&100u32,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client.try_set_fee_basis_points(&100).is_err(),
+            "non-admin caller must not be able to set the fee"
+        );
+        assert_eq!(client.get_fee_basis_points(), 25);
+    }
+
+    #[test]
+    fn test_fee_manager_auth_set_fee_missing_authorization_rejected() {
+        let fixture = setup_fee_manager_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = FeeManagerContractClient::new(&fixture.env, &fixture.contract_id);
+
+        assert!(
+            client.try_set_fee_basis_points(&100).is_err(),
+            "set_fee_basis_points must fail with no authorization provided"
+        );
+        assert_eq!(client.get_fee_basis_points(), 25);
+    }
+
+    #[test]
+    fn test_fee_manager_auth_set_fee_unrelated_authorization_rejected() {
+        let fixture = setup_fee_manager_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = FeeManagerContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // The admin authorizes an unrelated read-only function instead.
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "get_fee_basis_points",
+            args: ().into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        assert!(
+            client.try_set_fee_basis_points(&100).is_err(),
+            "authorization for an unrelated function must be rejected"
+        );
+        assert_eq!(client.get_fee_basis_points(), 25);
     }
 }

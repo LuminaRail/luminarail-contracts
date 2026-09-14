@@ -185,9 +185,9 @@ mod test {
     extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events},
+        testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
         token::StellarAssetClient,
-        Address, Env, Symbol, TryFromVal,
+        Address, Env, IntoVal, Symbol, TryFromVal,
     };
     use std::vec::Vec as StdVec;
 
@@ -400,5 +400,534 @@ mod test {
 
         let err = client.try_execute_settlement(&1).unwrap_err().unwrap();
         assert_eq!(err, Error::InvalidState);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Authorization matrix (issue #21)
+    //
+    // Privileged entrypoints: `initialize`, `create_settlement`,
+    // `execute_settlement`. Matrix tests never rely on `mock_all_auths` for the
+    // call under test: they provide exact `env.mock_auths()` entries so every
+    // `require_auth` must match the precise (address, fn, args) invocation tree
+    // or the call fails.
+    // ---------------------------------------------------------------------------
+
+    /// Initialized vault fixture. Auth mocking is left ENABLED after setup so
+    /// tests can create settlements; call `enforce_real_auth` before the
+    /// authorization matrix call under test.
+    struct VaultAuthFixture {
+        env: Env,
+        contract_id: Address,
+        admin: Address,
+        source: Address,
+        destination: Address,
+        token_address: Address,
+    }
+
+    fn setup_vault_auth_fixture() -> VaultAuthFixture {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        let destination = Address::generate(&env);
+        let (token_address, token_admin) = setup_test_token(&env, &admin);
+
+        token_admin.mint(&source, &5000);
+        client.initialize(&admin);
+
+        VaultAuthFixture {
+            env,
+            contract_id,
+            admin,
+            source,
+            destination,
+            token_address,
+        }
+    }
+
+    fn create_pending_settlement(fixture: &VaultAuthFixture, settlement_id: u64, amount: i128) {
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+        client.create_settlement(
+            &settlement_id,
+            &fixture.source,
+            &fixture.destination,
+            &fixture.token_address,
+            &amount,
+        );
+    }
+
+    /// Disables blanket auth mocking so only explicitly mocked authorizations pass.
+    fn enforce_real_auth(env: &Env) {
+        env.set_auths(&[]);
+    }
+
+    // -- initialize ------------------------------------------------------------
+
+    #[test]
+    fn test_vault_auth_initialize_admin_authorized_succeeds() {
+        let env = Env::default();
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        let admin_invoke = MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&admin,).into_val(&env),
+            sub_invokes: &[],
+        };
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &admin_invoke,
+        }]);
+
+        client.initialize(&admin);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_vault_auth_initialize_missing_authorization_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        assert!(
+            client.try_initialize(&admin).is_err(),
+            "initialize must fail without admin authorization"
+        );
+        // The admin must not have been recorded.
+        assert_eq!(
+            client.try_get_admin().unwrap_err().unwrap(),
+            Error::NotInitialized
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_initialize_unrelated_authorization_rejected() {
+        let env = Env::default();
+        let contract_id = env.register(SettlementVaultContract, ());
+        let client = SettlementVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // The attacker authorizes their own (attacker, initialize, (attacker))
+        // invocation; it must not satisfy the admin's authorization.
+        let attacker_invoke = MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&attacker,).into_val(&env),
+            sub_invokes: &[],
+        };
+        env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client.try_initialize(&admin).is_err(),
+            "unrelated authorization must not satisfy admin authorization"
+        );
+    }
+
+    // -- create_settlement -------------------------------------------------------
+
+    #[test]
+    fn test_vault_auth_create_settlement_admin_authorized_succeeds() {
+        let fixture = setup_vault_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let settlement_id = 100u64;
+        let amount = 2000i128;
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "create_settlement",
+            args: (
+                &settlement_id,
+                &fixture.source,
+                &fixture.destination,
+                &fixture.token_address,
+                &amount,
+            )
+                .into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        let record = client.create_settlement(
+            &settlement_id,
+            &fixture.source,
+            &fixture.destination,
+            &fixture.token_address,
+            &amount,
+        );
+        assert_eq!(record.status, SettlementStatus::Pending);
+        assert_eq!(
+            client.get_settlement(&settlement_id).status,
+            SettlementStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_create_settlement_non_admin_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let settlement_id = 100u64;
+        let amount = 2000i128;
+        let attacker = Address::generate(&fixture.env);
+        // The attacker fully authorizes the very same invocation, but from a
+        // non-admin address.
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "create_settlement",
+            args: (
+                &settlement_id,
+                &fixture.source,
+                &fixture.destination,
+                &fixture.token_address,
+                &amount,
+            )
+                .into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &attacker_invoke,
+        }]);
+
+        assert!(
+            client
+                .try_create_settlement(
+                    &settlement_id,
+                    &fixture.source,
+                    &fixture.destination,
+                    &fixture.token_address,
+                    &amount
+                )
+                .is_err(),
+            "non-admin caller must not be able to create a settlement"
+        );
+        // The settlement must not have been created.
+        assert_eq!(
+            client
+                .try_get_settlement(&settlement_id)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotFound
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_create_settlement_missing_authorization_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let settlement_id = 100u64;
+        let amount = 2000i128;
+        assert!(
+            client
+                .try_create_settlement(
+                    &settlement_id,
+                    &fixture.source,
+                    &fixture.destination,
+                    &fixture.token_address,
+                    &amount
+                )
+                .is_err(),
+            "create_settlement must fail with no authorization provided"
+        );
+        assert_eq!(
+            client
+                .try_get_settlement(&settlement_id)
+                .unwrap_err()
+                .unwrap(),
+            Error::NotFound
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_create_settlement_unrelated_authorization_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        let settlement_id = 100u64;
+        let amount = 2000i128;
+        // Admin authorizes an unrelated read-only function instead.
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "get_admin",
+            args: ().into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        assert!(
+            client
+                .try_create_settlement(
+                    &settlement_id,
+                    &fixture.source,
+                    &fixture.destination,
+                    &fixture.token_address,
+                    &amount
+                )
+                .is_err(),
+            "authorization for an unrelated function must be rejected"
+        );
+    }
+
+    // -- execute_settlement ------------------------------------------------------
+
+    #[test]
+    fn test_vault_auth_execute_settlement_admin_and_source_authorized_succeeds() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Source authorizes both the vault execution and the nested token transfer.
+        let transfer_invoke = MockAuthInvoke {
+            contract: &fixture.token_address,
+            fn_name: "transfer",
+            args: (&fixture.source, &fixture.destination, &amount).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let source_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[transfer_invoke],
+        };
+        fixture.env.mock_auths(&[
+            MockAuth {
+                address: &fixture.admin,
+                invoke: &admin_invoke,
+            },
+            MockAuth {
+                address: &fixture.source,
+                invoke: &source_invoke,
+            },
+        ]);
+
+        let record = client.execute_settlement(&settlement_id);
+        assert_eq!(record.status, SettlementStatus::Executed);
+
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.source), 3000);
+        assert_eq!(token_client.balance(&fixture.destination), 2000);
+    }
+
+    #[test]
+    fn test_vault_auth_execute_settlement_missing_admin_authorization_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Only the source authorizes; the admin authorization is missing.
+        let transfer_invoke = MockAuthInvoke {
+            contract: &fixture.token_address,
+            fn_name: "transfer",
+            args: (&fixture.source, &fixture.destination, &amount).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let source_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[transfer_invoke],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.source,
+            invoke: &source_invoke,
+        }]);
+
+        assert!(
+            client.try_execute_settlement(&settlement_id).is_err(),
+            "execution without admin authorization must be rejected"
+        );
+        assert_eq!(
+            client.get_settlement(&settlement_id).status,
+            SettlementStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_execute_settlement_missing_source_authorization_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Only the admin authorizes; the source authorization is missing.
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        assert!(
+            client.try_execute_settlement(&settlement_id).is_err(),
+            "execution without source authorization must be rejected"
+        );
+        assert_eq!(
+            client.get_settlement(&settlement_id).status,
+            SettlementStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_execute_settlement_missing_transfer_authorization_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Admin and source both authorize execute_settlement, but the source
+        // does not authorize the nested token transfer (partial authorization).
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let source_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[
+            MockAuth {
+                address: &fixture.admin,
+                invoke: &admin_invoke,
+            },
+            MockAuth {
+                address: &fixture.source,
+                invoke: &source_invoke,
+            },
+        ]);
+
+        assert!(
+            client.try_execute_settlement(&settlement_id).is_err(),
+            "execution without the nested transfer authorization must be rejected"
+        );
+        // No funds may have moved.
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.source), 5000);
+        assert_eq!(token_client.balance(&fixture.destination), 0);
+    }
+
+    #[test]
+    fn test_vault_auth_execute_settlement_unauthorized_source_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // An attacker authorizes the exact same invocation, but they are not
+        // the settlement source.
+        let attacker = Address::generate(&fixture.env);
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        let attacker_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&settlement_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[
+            MockAuth {
+                address: &fixture.admin,
+                invoke: &admin_invoke,
+            },
+            MockAuth {
+                address: &attacker,
+                invoke: &attacker_invoke,
+            },
+        ]);
+
+        assert!(
+            client.try_execute_settlement(&settlement_id).is_err(),
+            "an address other than the settlement source must be rejected"
+        );
+        let token_client = token::Client::new(&fixture.env, &fixture.token_address);
+        assert_eq!(token_client.balance(&fixture.source), 5000);
+        assert_eq!(
+            client.get_settlement(&settlement_id).status,
+            SettlementStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_execute_settlement_wrong_args_rejected() {
+        let fixture = setup_vault_auth_fixture();
+        let settlement_id = 7u64;
+        let amount = 2000i128;
+        create_pending_settlement(&fixture, settlement_id, amount);
+        enforce_real_auth(&fixture.env);
+        let client = SettlementVaultContractClient::new(&fixture.env, &fixture.contract_id);
+
+        // Authorizations recorded for a different settlement id must not
+        // satisfy the execution of this settlement.
+        let wrong_id = 99u64;
+        let admin_invoke = MockAuthInvoke {
+            contract: &fixture.contract_id,
+            fn_name: "execute_settlement",
+            args: (&wrong_id,).into_val(&fixture.env),
+            sub_invokes: &[],
+        };
+        fixture.env.mock_auths(&[MockAuth {
+            address: &fixture.admin,
+            invoke: &admin_invoke,
+        }]);
+
+        assert!(
+            client.try_execute_settlement(&settlement_id).is_err(),
+            "authorization with mismatched arguments must be rejected"
+        );
+        assert_eq!(
+            client.get_settlement(&settlement_id).status,
+            SettlementStatus::Pending
+        );
     }
 }
